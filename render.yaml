@@ -1,0 +1,59 @@
+# Render Blueprint — arena-duo-api
+#
+# Como usar:
+#   1. Coloque este arquivo na raiz do seu repositório Git.
+#   2. No Render: New > Blueprint > aponte para o repo.
+#   3. O Render lê este arquivo, cria o Web Service e o disco persistente,
+#      e pede para você preencher os dois secrets marcados com `sync: false`.
+#
+# Referência: https://render.com/docs/blueprint-spec
+
+services:
+  - type: web
+    name: arena-duo-api
+    runtime: python
+    plan: starter            # $7/mês. "free" NÃO funciona (disco efêmero + spin-down).
+    region: ohio             # Mais próximo do BR na maioria dos casos.
+    branch: main
+    autoDeploy: true         # Cada `git push` origin main dispara um deploy.
+
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn api:app --host 0.0.0.0 --port $PORT --workers 1
+
+    healthCheckPath: /health
+
+    disk:
+      name: arena-data
+      mountPath: /var/data
+      sizeGB: 1              # ~50 MB por 1000 matches. 1 GB dá folga enorme.
+
+    envVars:
+      # --- Secrets (você preenche no dashboard no primeiro deploy) ---
+      - key: RIOT_API_KEY
+        sync: false
+      - key: ARENA_ADMIN_TOKEN
+        sync: false
+
+      # --- Configuração do coletor e da API ---
+      - key: ARENA_DUMP_DIR
+        value: /var/data/arena_program1_dump
+      - key: ARENA_DUOS_XLSX
+        value: /opt/render/project/src/duplas.xlsx
+      - key: ARENA_PHOTOS_JSON
+        value: /opt/render/project/src/players_photos.json
+      - key: ARENA_COLLECTOR_SCRIPT
+        value: /opt/render/project/src/arena_duo_program1.py
+      - key: ARENA_REFRESH_MINUTES
+        value: "5"
+      - key: ARENA_REFRESH_ON_STARTUP
+        value: "1"
+      - key: ARENA_COLLECTOR_NO_TIMELINE
+        value: "0"
+
+      # --- CORS: ajuste para a URL do seu front quando ele estiver no ar ---
+      - key: ARENA_CORS_ORIGINS
+        value: "*"
+
+      # --- Runtime ---
+      - key: PYTHON_VERSION
+        value: 3.12.8

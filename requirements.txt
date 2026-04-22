@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+apscheduler>=3.10
+pydantic>=2.6
+# dependências do coletor (se não estiverem instaladas):
+openpyxl>=3.1
+requests>=2.31

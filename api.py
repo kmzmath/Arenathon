@@ -17,6 +17,7 @@ Config via variáveis de ambiente:
     ARENA_DUMP_DIR                 default: ./arena_program1_dump
     ARENA_DUOS_XLSX                default: ./duplas.xlsx
     ARENA_PHOTOS_JSON              default: ./players_photos.json
+    ARENA_CHAMPIONS_JSON           default: ./champion_images.json
     ARENA_COLLECTOR_SCRIPT         default: ./arena_duo_program1.py
     ARENA_REFRESH_MINUTES          default: 5
     ARENA_REFRESH_ON_STARTUP       default: 1   (0 para desligar)
@@ -58,6 +59,7 @@ TZ = ZoneInfo("America/Sao_Paulo")
 DUMP_DIR = Path(os.getenv("ARENA_DUMP_DIR", "./arena_program1_dump")).resolve()
 DUOS_XLSX = Path(os.getenv("ARENA_DUOS_XLSX", "./duplas.xlsx")).resolve()
 PHOTOS_JSON = Path(os.getenv("ARENA_PHOTOS_JSON", "./players_photos.json")).resolve()
+CHAMPIONS_JSON = Path(os.getenv("ARENA_CHAMPIONS_JSON", "./champion_images.json")).resolve()
 COLLECTOR_SCRIPT = Path(os.getenv("ARENA_COLLECTOR_SCRIPT", "./arena_duo_program1.py")).resolve()
 
 API_KEY = os.getenv("RIOT_API_KEY", "")
@@ -202,6 +204,17 @@ def _load_photos_map() -> Dict[str, str]:
         return {}
 
 
+def _load_champions_map() -> Dict[str, str]:
+    """Mapa championName (ex: 'Aatrox', 'MonkeyKing') → URL da tile do campeão."""
+    if not CHAMPIONS_JSON.exists():
+        return {}
+    try:
+        return json.loads(CHAMPIONS_JSON.read_text(encoding="utf-8"))
+    except Exception:
+        log.exception("Falha ao ler %s", CHAMPIONS_JSON)
+        return {}
+
+
 def _load_valid_matches() -> Dict[str, Any]:
     path = DUMP_DIR / "valid_matches.json"
     if not path.exists():
@@ -243,6 +256,7 @@ class PlayerMatchStats(BaseModel):
     photo_url: Optional[str] = None
     champion_name: Optional[str] = None
     champion_id: Optional[int] = None
+    champion_image_url: Optional[str] = None
     kills: Optional[int] = None
     deaths: Optional[int] = None
     assists: Optional[int] = None
@@ -322,7 +336,10 @@ def _player_info(riot_id: str, players_idx: Dict[str, Any], photos: Dict[str, st
 
 
 def _build_match_stats(
-    participant: Dict[str, Any], riot_id: str, photos: Dict[str, str]
+    participant: Dict[str, Any],
+    riot_id: str,
+    photos: Dict[str, str],
+    champions: Dict[str, str],
 ) -> PlayerMatchStats:
     augments = [
         participant.get("player_augment1"),
@@ -335,12 +352,14 @@ def _build_match_stats(
         if extra in participant and participant.get(extra) is not None:
             augments.append(participant.get(extra))
 
+    champion_name = participant.get("champion_name")
     return PlayerMatchStats(
         riot_id=riot_id,
         game_name=participant.get("riot_id_game_name"),
         photo_url=photos.get(riot_id),
-        champion_name=participant.get("champion_name"),
+        champion_name=champion_name,
         champion_id=participant.get("champion_id"),
+        champion_image_url=champions.get(champion_name) if champion_name else None,
         kills=participant.get("kills"),
         deaths=participant.get("deaths"),
         assists=participant.get("assists"),
@@ -351,7 +370,9 @@ def _build_match_stats(
     )
 
 
-def _build_match_summary(row: Dict[str, Any], photos: Dict[str, str]) -> MatchSummary:
+def _build_match_summary(
+    row: Dict[str, Any], photos: Dict[str, str], champions: Dict[str, str]
+) -> MatchSummary:
     return MatchSummary(
         match_id=row["match_id"],
         queue_id=row.get("queue_id"),
@@ -362,8 +383,8 @@ def _build_match_summary(row: Dict[str, Any], photos: Dict[str, str]) -> MatchSu
         game_duration_seconds=row.get("game_duration_seconds"),
         subteam_placement=row.get("subteam_placement"),
         points=row.get("points"),
-        player1=_build_match_stats(row.get("player1", {}), row["player1_riot_id"], photos),
-        player2=_build_match_stats(row.get("player2", {}), row["player2_riot_id"], photos),
+        player1=_build_match_stats(row.get("player1", {}), row["player1_riot_id"], photos, champions),
+        player2=_build_match_stats(row.get("player2", {}), row["player2_riot_id"], photos, champions),
     )
 
 
@@ -375,6 +396,7 @@ def _build_view() -> Tuple[List[DuoSummary], Dict[str, List[MatchSummary]], Opti
     resolved_duos = _load_resolved_duos()
     players_idx = _load_players_index()
     photos = _load_photos_map()
+    champions = _load_champions_map()
 
     # Indexa o scoreboard por duo_id pra fazer left-join. Duplas sem partidas
     # válidas não estarão aqui — usaremos zeros pra elas.
@@ -410,7 +432,7 @@ def _build_view() -> Tuple[List[DuoSummary], Dict[str, List[MatchSummary]], Opti
 
     by_duo: Dict[str, List[MatchSummary]] = {}
     for row in rows:
-        ms = _build_match_summary(row, photos)
+        ms = _build_match_summary(row, photos, champions)
         by_duo.setdefault(row["duo_id"], []).append(ms)
     for duo_id in by_duo:
         by_duo[duo_id].sort(key=lambda m: m.game_start_local or "", reverse=True)
@@ -469,6 +491,7 @@ def health() -> Dict[str, Any]:
         "collector_script_exists": COLLECTOR_SCRIPT.exists(),
         "duos_xlsx_exists": DUOS_XLSX.exists(),
         "photos_json_exists": PHOTOS_JSON.exists(),
+        "champions_json_exists": CHAMPIONS_JSON.exists(),
         "riot_api_key_set": bool(API_KEY),
         "refresh_minutes": REFRESH_MINUTES,
         "collector": _state,

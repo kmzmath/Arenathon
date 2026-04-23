@@ -41,6 +41,8 @@ services:
         value: /opt/render/project/src/duplas.xlsx
       - key: ARENA_PHOTOS_JSON
         value: /opt/render/project/src/players_photos.json
+      - key: ARENA_CHAMPIONS_JSON
+        value: /opt/render/project/src/champion_images.json
       - key: ARENA_COLLECTOR_SCRIPT
         value: /opt/render/project/src/arena_duo_program1.py
       - key: ARENA_REFRESH_MINUTES

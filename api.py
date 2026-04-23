@@ -1,3 +1,33 @@
+#!/usr/bin/env python3
+"""
+Arena Duo Championship API.
+
+Serve os dados coletados por `arena_duo_program1.py` para o front-end do
+campeonato e dispara o coletor periodicamente via APScheduler.
+
+Endpoints:
+    GET  /health                    -> status do serviço e do coletor
+    GET  /scoreboard                -> ranking ordenado (sem partidas)
+    GET  /duos/{duo_id}             -> dupla + todas as partidas contabilizadas
+    GET  /duos/{duo_id}/matches     -> só as partidas da dupla
+    POST /refresh                   -> dispara coleta imediata (opcional token)
+
+Config via variáveis de ambiente:
+    RIOT_API_KEY                   (obrigatória)
+    ARENA_DUMP_DIR                 default: ./arena_program1_dump
+    ARENA_DUOS_XLSX                default: ./duplas.xlsx
+    ARENA_PHOTOS_JSON              default: ./players_photos.json
+    ARENA_COLLECTOR_SCRIPT         default: ./arena_duo_program1.py
+    ARENA_REFRESH_MINUTES          default: 5
+    ARENA_REFRESH_ON_STARTUP       default: 1   (0 para desligar)
+    ARENA_COLLECTOR_NO_TIMELINE    default: 0   (1 para economizar API calls)
+    ARENA_COLLECTOR_TIMEOUT        default: 600
+    ARENA_CORS_ORIGINS             default: *   (separado por vírgula)
+    ARENA_ADMIN_TOKEN              default: vazio (sem proteção em /refresh)
+
+Executar:
+    uvicorn api:app --host 0.0.0.0 --port 8000
+"""
 from __future__ import annotations
 
 import csv
@@ -179,6 +209,16 @@ def _load_valid_matches() -> Dict[str, Any]:
     return _read_json_with_retry(path)
 
 
+def _load_resolved_duos() -> List[Dict[str, Any]]:
+    """Lista de duplas resolvidas (com PUUID etc), independentemente de terem
+    partidas válidas. É a fonte de verdade da composição do torneio."""
+    path = DUMP_DIR / "duos_resolved.json"
+    if not path.exists():
+        return []
+    data = _read_json_with_retry(path)
+    return data.get("duos", [])
+
+
 def _load_scoreboard_csv() -> List[Dict[str, Any]]:
     path = DUMP_DIR / "scoreboard.csv"
     if not path.exists():
@@ -332,24 +372,41 @@ def _build_view() -> Tuple[List[DuoSummary], Dict[str, List[MatchSummary]], Opti
     rows = valid.get("rows", [])
     window = valid.get("window")
     scoreboard_csv = _load_scoreboard_csv()
+    resolved_duos = _load_resolved_duos()
     players_idx = _load_players_index()
     photos = _load_photos_map()
 
+    # Indexa o scoreboard por duo_id pra fazer left-join. Duplas sem partidas
+    # válidas não estarão aqui — usaremos zeros pra elas.
+    score_by_id: Dict[str, Dict[str, Any]] = {s["duo_id"]: s for s in scoreboard_csv}
+
     summaries: List[DuoSummary] = []
-    for i, s in enumerate(scoreboard_csv, start=1):
+    for duo in resolved_duos:
+        s = score_by_id.get(duo["duo_id"], {})
         placements = {
             str(k): int(s.get(f"placements_{k}") or 0) for k in range(1, 9)
         }
         summaries.append(DuoSummary(
-            rank=i,
-            duo_id=s["duo_id"],
-            duo_name=s["duo_name"],
+            rank=0,  # preenchido após ordenação
+            duo_id=duo["duo_id"],
+            duo_name=duo["duo_name"],
             total_points=int(s.get("total_points") or 0),
             valid_matches=int(s.get("valid_matches") or 0),
             placements=placements,
-            player1=_player_info(s["player1_riot_id"], players_idx, photos),
-            player2=_player_info(s["player2_riot_id"], players_idx, photos),
+            player1=_player_info(duo["player1_riot_id"], players_idx, photos),
+            player2=_player_info(duo["player2_riot_id"], players_idx, photos),
         ))
+
+    # Ordena: pontos desc, depois 1ºs, 2ºs, e duo_id como desempate estável.
+    # Duplas sem partidas (0 pts, 0 placements) caem no fim, ordenadas por duo_id.
+    summaries.sort(key=lambda d: (
+        -d.total_points,
+        -d.placements["1"],
+        -d.placements["2"],
+        d.duo_id,
+    ))
+    for i, d in enumerate(summaries, start=1):
+        d.rank = i
 
     by_duo: Dict[str, List[MatchSummary]] = {}
     for row in rows:
@@ -391,7 +448,7 @@ async def lifespan(_: FastAPI):
         scheduler.shutdown(wait=False)
 
 
-app = FastAPI(title="Arenathon API", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Arena Duo Championship API", version="1.0.0", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -420,10 +477,7 @@ def health() -> Dict[str, Any]:
 
 @app.get("/scoreboard", response_model=ScoreboardResponse)
 def scoreboard() -> ScoreboardResponse:
-    try:
-        summaries, _, window = _build_view()
-    except FileNotFoundError:
-        raise HTTPException(status_code=503, detail="Coleta ainda não foi executada. Aguarde.")
+    summaries, _, window = _build_view()
     return ScoreboardResponse(
         last_updated=_state["last_success_at"],
         window=window,

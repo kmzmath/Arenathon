@@ -44,11 +44,11 @@ services:
       - key: ARENA_COLLECTOR_SCRIPT
         value: /opt/render/project/src/arena_duo_program1.py
       - key: ARENA_REFRESH_MINUTES
-        value: "5"
+        value: "3"
       - key: ARENA_REFRESH_ON_STARTUP
         value: "1"
       - key: ARENA_COLLECTOR_NO_TIMELINE
-        value: "0"
+        value: "1"
 
       # --- CORS: ajuste para a URL do seu front quando ele estiver no ar ---
       - key: ARENA_CORS_ORIGINS

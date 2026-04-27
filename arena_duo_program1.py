@@ -153,8 +153,27 @@ def ensure_dir(path: Path) -> None:
 
 
 def save_json(path: Path, data: Any) -> None:
+    """Escreve JSON via arquivo temporário e troca atômica.
+
+    Isso impede que a API leia um JSON parcialmente escrito enquanto o
+    coletor está gerando uma nova rodada de dados.
+    """
     ensure_dir(path.parent)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+
+    try:
+        with tmp_path.open("w", encoding="utf-8") as fp:
+            fp.write(content)
+            fp.flush()
+            os.fsync(fp.fileno())
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if tmp_path.exists():
+                tmp_path.unlink()
+        except Exception:
+            logging.exception("Falha removendo arquivo temporário %s", tmp_path)
 
 
 def load_json(path: Path) -> Any:
@@ -893,6 +912,8 @@ def main() -> int:
         format="%(asctime)s | %(levelname)s | %(message)s",
     )
 
+    run_started_monotonic = time.time()
+
     output_dir = Path(args.output)
     ensure_dir(output_dir)
 
@@ -1159,7 +1180,36 @@ def main() -> int:
     scoreboard_rows = build_scoreboard_rows(valid_rows)
     flatten_csv_rows(output_dir / "scoreboard.csv", scoreboard_rows)
 
+    run_id = datetime.now(TOURNAMENT_TZ).isoformat()
+    duration_seconds = round(time.time() - run_started_monotonic, 2)
+
+    public_snapshot = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "generated_at": run_id,
+        "collector_duration_seconds": duration_seconds,
+        "window": asdict(window),
+        "scoreboard": scoreboard_rows,
+        "duos_resolved": [asdict(duo) for duo in duos],
+        "players_resolved": [asdict(player) for player in players.values()],
+        "valid_matches": valid_rows,
+        "counts": {
+            "duos_input_count": len(duos_raw),
+            "duos_resolved_count": len(duos),
+            "players_unique_count": len(unique_riot_ids),
+            "players_resolved_count": len(players),
+            "valid_matches_count": len(valid_rows),
+            "invalid_matches_count": len(invalid_rows),
+            "download_errors_count": len(download_errors),
+        },
+    }
+    save_json(output_dir / "public_snapshot.json", public_snapshot)
+
     run_manifest = {
+        "schema_version": 1,
+        "run_id": run_id,
+        "generated_at": run_id,
+        "duration_seconds": duration_seconds,
         "window": asdict(window),
         "duos_input_count": len(duos_raw),
         "duos_resolved_count": len(duos),
@@ -1182,6 +1232,7 @@ def main() -> int:
             "invalid_matches_json": str((output_dir / "invalid_matches.json").resolve()),
             "duo_matches_csv": str((output_dir / "duo_matches.csv").resolve()),
             "scoreboard_csv": str((output_dir / "scoreboard.csv").resolve()),
+            "public_snapshot_json": str((output_dir / "public_snapshot.json").resolve()),
             "raw_matches_dir": str(raw_matches_dir.resolve()),
             "raw_timelines_dir": str(raw_timelines_dir.resolve()) if not args.no_timeline else None,
         },

@@ -44,6 +44,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
+import math
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, Header, HTTPException
@@ -89,6 +90,9 @@ _state: Dict[str, Any] = {
     "runs_failed": 0,
     "last_exit_code": None,
     "last_download_errors": None,
+    "valid_matches_count": None,
+    "invalid_matches_count": None,
+    "players_resolved_count": None,
 }
 
 
@@ -142,16 +146,11 @@ def _run_collector() -> None:
                 + "\n".join(tail)
             )
 
-        # Lê o manifest para expor algumas métricas
-        manifest_path = DUMP_DIR / "run_manifest.json"
-        if manifest_path.exists():
-            try:
-                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-                _state["last_download_errors"] = manifest.get("download_errors_count")
-            except Exception:
-                _state["last_download_errors"] = None
-
-        _state["last_success_at"] = datetime.now(TZ).isoformat()
+        # Lê o manifest/snapshot recém-gerados para expor métricas persistidas.
+        previous_success_at = _state.get("last_success_at")
+        _hydrate_state_from_disk()
+        if _state.get("last_success_at") == previous_success_at:
+            _state["last_success_at"] = datetime.now(TZ).isoformat()
         _state["last_error"] = None
         if result.returncode == 1:
             log.warning("Coletor terminou com erros de download parciais.")
@@ -170,6 +169,27 @@ def _run_collector() -> None:
         _collection_lock.release()
 
 
+def _schedule_status() -> Dict[str, Any]:
+    now = datetime.now(TZ)
+    job = scheduler.get_job("collector_job")
+
+    next_refresh_at = None
+    seconds_until_next_refresh = None
+
+    if job and job.next_run_time:
+        next_dt = job.next_run_time.astimezone(TZ)
+        next_refresh_at = next_dt.isoformat()
+        seconds_until_next_refresh = max(
+            0,
+            math.ceil((next_dt - now).total_seconds())
+        )
+
+    return {
+        "refresh_interval_seconds": REFRESH_MINUTES * 60,
+        "next_refresh_at": next_refresh_at,
+        "seconds_until_next_refresh": seconds_until_next_refresh,
+    }
+
 # --------------------------------------------------------------------------
 # Leitura dos artefatos gerados pelo coletor
 # --------------------------------------------------------------------------
@@ -184,6 +204,168 @@ def _read_json_with_retry(path: Path, retries: int = 3, delay: float = 0.2) -> A
             time.sleep(delay)
     assert last_exc is not None
     raise last_exc
+
+
+def _load_public_snapshot() -> Dict[str, Any]:
+    """Carrega o snapshot único usado como fonte de verdade da API pública."""
+    path = DUMP_DIR / "public_snapshot.json"
+    if not path.exists():
+        raise FileNotFoundError(f"Snapshot público não encontrado: {path}")
+    snapshot = _read_json_with_retry(path)
+    if snapshot.get("schema_version") != 1:
+        log.warning("public_snapshot.json com schema_version inesperado: %r", snapshot.get("schema_version"))
+    return snapshot
+
+
+def _load_public_snapshot_optional() -> Optional[Dict[str, Any]]:
+    try:
+        return _load_public_snapshot()
+    except FileNotFoundError:
+        return None
+    except Exception:
+        log.exception("Falha ao ler public_snapshot.json")
+        return None
+
+
+def _load_run_manifest_optional() -> Optional[Dict[str, Any]]:
+    path = DUMP_DIR / "run_manifest.json"
+    if not path.exists():
+        return None
+    try:
+        return _read_json_with_retry(path)
+    except Exception:
+        log.exception("Falha ao ler run_manifest.json")
+        return None
+
+
+def _coerce_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _counts_from_snapshot(snapshot: Optional[Dict[str, Any]]) -> Dict[str, Optional[int]]:
+    if not snapshot:
+        return {}
+    counts = snapshot.get("counts") or {}
+    return {
+        "duos_count": _coerce_int(counts.get("duos_resolved_count"))
+            or _coerce_int(len(snapshot.get("duos_resolved") or [])),
+        "valid_matches_count": _coerce_int(counts.get("valid_matches_count"))
+            or _coerce_int(len(snapshot.get("valid_matches") or [])),
+        "invalid_matches_count": _coerce_int(counts.get("invalid_matches_count")),
+        "download_errors_count": _coerce_int(counts.get("download_errors_count")),
+        "players_resolved_count": _coerce_int(counts.get("players_resolved_count"))
+            or _coerce_int(len(snapshot.get("players_resolved") or [])),
+    }
+
+
+def _counts_from_manifest(manifest: Optional[Dict[str, Any]]) -> Dict[str, Optional[int]]:
+    if not manifest:
+        return {}
+    return {
+        "duos_count": _coerce_int(manifest.get("duos_resolved_count")),
+        "valid_matches_count": _coerce_int(manifest.get("valid_matches_count")),
+        "invalid_matches_count": _coerce_int(manifest.get("invalid_matches_count")),
+        "download_errors_count": _coerce_int(manifest.get("download_errors_count")),
+        "players_resolved_count": _coerce_int(manifest.get("players_resolved_count")),
+    }
+
+
+def _first_non_none(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
+
+
+def _hydrate_state_from_disk() -> None:
+    """Reidrata métricas do coletor após restart do processo.
+
+    O estado em memória zera quando o Render reinicia. O run_manifest.json e o
+    public_snapshot.json mantêm a última coleta válida em disco, então usamos
+    esses arquivos para deixar /health útil imediatamente após startup.
+    """
+    manifest = _load_run_manifest_optional()
+    snapshot = _load_public_snapshot_optional()
+    snapshot_counts = _counts_from_snapshot(snapshot)
+    manifest_counts = _counts_from_manifest(manifest)
+
+    last_success_at = _first_non_none(
+        manifest.get("generated_at") if manifest else None,
+        manifest.get("run_id") if manifest else None,
+        snapshot.get("generated_at") if snapshot else None,
+        snapshot.get("run_id") if snapshot else None,
+    )
+    duration_seconds = _first_non_none(
+        _coerce_float(manifest.get("duration_seconds")) if manifest else None,
+        _coerce_float(manifest.get("collector_duration_seconds")) if manifest else None,
+        _coerce_float(snapshot.get("collector_duration_seconds")) if snapshot else None,
+    )
+
+    if last_success_at:
+        _state["last_success_at"] = last_success_at
+    if duration_seconds is not None:
+        _state["last_duration_seconds"] = duration_seconds
+
+    _state["last_download_errors"] = _first_non_none(
+        manifest_counts.get("download_errors_count"),
+        snapshot_counts.get("download_errors_count"),
+        _state.get("last_download_errors"),
+    )
+    _state["valid_matches_count"] = _first_non_none(
+        manifest_counts.get("valid_matches_count"),
+        snapshot_counts.get("valid_matches_count"),
+        _state.get("valid_matches_count"),
+    )
+    _state["invalid_matches_count"] = _first_non_none(
+        manifest_counts.get("invalid_matches_count"),
+        snapshot_counts.get("invalid_matches_count"),
+        _state.get("invalid_matches_count"),
+    )
+    _state["players_resolved_count"] = _first_non_none(
+        manifest_counts.get("players_resolved_count"),
+        snapshot_counts.get("players_resolved_count"),
+        _state.get("players_resolved_count"),
+    )
+
+
+def _ranking_health() -> Dict[str, Any]:
+    snapshot = _load_public_snapshot_optional()
+    manifest = _load_run_manifest_optional()
+    snapshot_counts = _counts_from_snapshot(snapshot)
+    manifest_counts = _counts_from_manifest(manifest)
+
+    window = (snapshot or {}).get("window") or (manifest or {}).get("window") or {}
+    return {
+        "duos_count": _first_non_none(snapshot_counts.get("duos_count"), manifest_counts.get("duos_count")),
+        "valid_matches_count": _first_non_none(snapshot_counts.get("valid_matches_count"), manifest_counts.get("valid_matches_count")),
+        "invalid_matches_count": _first_non_none(snapshot_counts.get("invalid_matches_count"), manifest_counts.get("invalid_matches_count")),
+        "download_errors_count": _first_non_none(snapshot_counts.get("download_errors_count"), manifest_counts.get("download_errors_count")),
+        "players_resolved_count": _first_non_none(snapshot_counts.get("players_resolved_count"), manifest_counts.get("players_resolved_count")),
+        "window_start": window.get("start_local_iso"),
+        "window_end": window.get("end_local_iso"),
+        "snapshot_run_id": _first_non_none(
+            (snapshot or {}).get("run_id"),
+            (snapshot or {}).get("generated_at"),
+            (manifest or {}).get("run_id"),
+            (manifest or {}).get("generated_at"),
+        ),
+        "snapshot_exists": bool(snapshot),
+        "manifest_exists": bool(manifest),
+    }
 
 
 def _load_players_index() -> Dict[str, Dict[str, Any]]:
@@ -305,6 +487,9 @@ class CollectorStatus(BaseModel):
     runs_failed: int = 0
     last_exit_code: Optional[int] = None
     last_download_errors: Optional[int] = None
+    valid_matches_count: Optional[int] = None
+    invalid_matches_count: Optional[int] = None
+    players_resolved_count: Optional[int] = None
 
 
 class ScoreboardResponse(BaseModel):
@@ -388,19 +573,26 @@ def _build_match_summary(
     )
 
 
-def _build_view() -> Tuple[List[DuoSummary], Dict[str, List[MatchSummary]], Optional[Dict[str, Any]]]:
-    valid = _load_valid_matches()
-    rows = valid.get("rows", [])
-    window = valid.get("window")
-    scoreboard_csv = _load_scoreboard_csv()
-    resolved_duos = _load_resolved_duos()
-    players_idx = _load_players_index()
+def _build_view() -> Tuple[List[DuoSummary], Dict[str, List[MatchSummary]], Optional[Dict[str, Any]], Optional[str]]:
+    snapshot = _load_public_snapshot()
+
+    rows = snapshot.get("valid_matches", [])
+    window = snapshot.get("window")
+    generated_at = snapshot.get("generated_at")
+    scoreboard_rows = snapshot.get("scoreboard", [])
+    resolved_duos = snapshot.get("duos_resolved", [])
+    players_idx = {
+        p["riot_id"]: p
+        for p in snapshot.get("players_resolved", [])
+        if isinstance(p, dict) and p.get("riot_id")
+    }
+
     photos = _load_photos_map()
     champions = _load_champions_map()
 
-    # Indexa o scoreboard por duo_id pra fazer left-join. Duplas sem partidas
-    # válidas não estarão aqui — usaremos zeros pra elas.
-    score_by_id: Dict[str, Dict[str, Any]] = {s["duo_id"]: s for s in scoreboard_csv}
+    # O snapshot passa a ser a fonte de verdade do ranking. O CSV continua
+    # podendo existir para auditoria, mas não é mais lido pela API pública.
+    score_by_id: Dict[str, Dict[str, Any]] = {s["duo_id"]: s for s in scoreboard_rows}
 
     summaries: List[DuoSummary] = []
     for duo in resolved_duos:
@@ -419,8 +611,8 @@ def _build_view() -> Tuple[List[DuoSummary], Dict[str, List[MatchSummary]], Opti
             player2=_player_info(duo["player2_riot_id"], players_idx, photos),
         ))
 
-    # Ordena: pontos desc, depois 1ºs, 2ºs, e duo_id como desempate estável.
-    # Duplas sem partidas (0 pts, 0 placements) caem no fim, ordenadas por duo_id.
+    # Ordena novamente para manter o contrato estável mesmo se o snapshot for
+    # gerado por uma versão futura do coletor com ordem diferente.
     summaries.sort(key=lambda d: (
         -d.total_points,
         -d.placements["1"],
@@ -437,8 +629,7 @@ def _build_view() -> Tuple[List[DuoSummary], Dict[str, List[MatchSummary]], Opti
     for duo_id in by_duo:
         by_duo[duo_id].sort(key=lambda m: m.game_start_local or "", reverse=True)
 
-    return summaries, by_duo, window
-
+    return summaries, by_duo, window, generated_at
 
 # --------------------------------------------------------------------------
 # FastAPI app + scheduler
@@ -448,6 +639,8 @@ scheduler = BackgroundScheduler(timezone=str(TZ))
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    _hydrate_state_from_disk()
+
     if REFRESH_ON_STARTUP:
         threading.Thread(target=_run_collector, daemon=True).start()
 
@@ -455,7 +648,6 @@ async def lifespan(_: FastAPI):
         _run_collector,
         trigger="interval",
         minutes=REFRESH_MINUTES,
-        jitter=30,
         max_instances=1,
         coalesce=True,
         id="collector_job",
@@ -494,15 +686,20 @@ def health() -> Dict[str, Any]:
         "champions_json_exists": CHAMPIONS_JSON.exists(),
         "riot_api_key_set": bool(API_KEY),
         "refresh_minutes": REFRESH_MINUTES,
+        "schedule": _schedule_status(),
         "collector": _state,
+        "ranking": _ranking_health(),
     }
 
 
 @app.get("/scoreboard", response_model=ScoreboardResponse)
 def scoreboard() -> ScoreboardResponse:
-    summaries, _, window = _build_view()
+    try:
+        summaries, _, window, generated_at = _build_view()
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="Coleta ainda não foi executada.")
     return ScoreboardResponse(
-        last_updated=_state["last_success_at"],
+        last_updated=_state["last_success_at"] or generated_at,
         window=window,
         collector=CollectorStatus(**_state),
         duos=summaries,
@@ -512,7 +709,7 @@ def scoreboard() -> ScoreboardResponse:
 @app.get("/duos/{duo_id}", response_model=DuoDetail)
 def duo_detail(duo_id: str) -> DuoDetail:
     try:
-        summaries, by_duo, _ = _build_view()
+        summaries, by_duo, _, _ = _build_view()
     except FileNotFoundError:
         raise HTTPException(status_code=503, detail="Coleta ainda não foi executada.")
     duo = next((d for d in summaries if d.duo_id == duo_id), None)
@@ -524,7 +721,7 @@ def duo_detail(duo_id: str) -> DuoDetail:
 @app.get("/duos/{duo_id}/matches", response_model=List[MatchSummary])
 def duo_matches(duo_id: str) -> List[MatchSummary]:
     try:
-        _, by_duo, _ = _build_view()
+        _, by_duo, _, _ = _build_view()
     except FileNotFoundError:
         raise HTTPException(status_code=503, detail="Coleta ainda não foi executada.")
     return by_duo.get(duo_id, [])

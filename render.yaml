@@ -54,7 +54,7 @@ services:
 
       # --- CORS: ajuste para a URL do seu front quando ele estiver no ar ---
       - key: ARENA_CORS_ORIGINS
-        value: "*"
+        value: "https://www.arenathon.com.br/"
 
       # --- Runtime ---
       - key: PYTHON_VERSION

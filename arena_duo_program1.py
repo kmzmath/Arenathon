@@ -23,7 +23,7 @@ Uso básico:
 
 Observações:
 - A janela default é a do campeonato:
-  2026-04-29 13:00:00 até 2026-05-13 23:59:59 em America/Sao_Paulo.
+  2026-04-29 15:00:00 até 2026-05-13 23:59:59 em America/Sao_Paulo.
 - O script revalida a janela no payload bruto da partida, mesmo usando startTime/endTime na API.
 - Uma partida válida é contabilizada por "dupla + match_id", nunca por jogador.
 """
@@ -66,12 +66,8 @@ POINTS_BY_PLACEMENT = {
     8: -8,
 }
 
-DEFAULT_START_LOCAL = datetime(2026, 1, 29, 13, 0, 0, tzinfo=TOURNAMENT_TZ)
+DEFAULT_START_LOCAL = datetime(2026, 4, 29, 15, 0, 0, tzinfo=TOURNAMENT_TZ)
 DEFAULT_END_LOCAL = datetime(2026, 5, 13, 23, 59, 59, tzinfo=TOURNAMENT_TZ)
-
-# Janela oficial
-#DEFAULT_START_LOCAL = datetime(2026, 4, 29, 13, 0, 0, tzinfo=TOURNAMENT_TZ)
-#DEFAULT_END_LOCAL = datetime(2026, 5, 13, 23, 59, 59, tzinfo=TOURNAMENT_TZ)
 
 PLATFORM_TO_REGION = {
     "BR1": "americas",

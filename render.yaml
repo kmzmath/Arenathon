@@ -54,7 +54,7 @@ services:
 
       # --- CORS: ajuste para a URL do seu front quando ele estiver no ar ---
       - key: ARENA_CORS_ORIGINS
-        value: "https://www.arenathon.com.br,https://arena-lol-web.vercel.app"
+        value: "https://www.arenathon.com.br,https://arena-lol-web.vercel.app,http://localhost:3000"
 
       # --- Runtime ---
       - key: PYTHON_VERSION

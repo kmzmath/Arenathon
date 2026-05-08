@@ -176,6 +176,68 @@ def load_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_manual_match_exclusions(path: Path) -> Dict[Tuple[str, str], Dict[str, Any]]:
+    """Carrega exclusões manuais persistentes por (duo_id, match_id).
+
+    Essas exclusões servem para retirar partidas do ranking/public_snapshot sem
+    precisar apagar arquivos manualmente. O coletor continuará vendo o match_id
+    na API, mas não o recolocará em valid_matches.
+    """
+    if not path.exists():
+        return {}
+
+    try:
+        data = load_json(path)
+    except Exception:
+        logging.exception("Falha lendo exclusões manuais em %s. Ignorando.", path)
+        return {}
+
+    result: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    for entry in data.get("excluded_matches", []):
+        if not isinstance(entry, dict):
+            continue
+
+        duo_id = str(entry.get("duo_id", "")).strip()
+        match_id = str(entry.get("match_id", "")).strip()
+        if not duo_id or not match_id:
+            continue
+
+        result[(duo_id, match_id)] = entry
+
+    return result
+
+
+def build_manual_exclusion_row(
+    duo: DuoRef,
+    match_id: str,
+    source_label: str,
+    exclusion: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "duo_id": duo.duo_id,
+        "duo_name": duo.duo_name,
+        "player1_riot_id": duo.player1_riot_id,
+        "player2_riot_id": duo.player2_riot_id,
+        "player1_puuid": duo.player1_puuid,
+        "player2_puuid": duo.player2_puuid,
+        "platform": duo.platform,
+        "regional_cluster": duo.regional_cluster,
+        "match_id": match_id,
+        "queue_id": None,
+        "game_mode": None,
+        "game_start_timestamp": None,
+        "game_start_local": None,
+        "candidate_source": source_label,
+        "match_json_path": None,
+        "timeline_json_path": None,
+        "reason": "manual_exclusion",
+        "manual_exclusion_reason": exclusion.get("reason"),
+        "manual_exclusion_source": exclusion.get("source"),
+        "manual_exclusion_reviewed_at": exclusion.get("reviewed_at"),
+        "manual_exclusion_notes": exclusion.get("notes"),
+    }
+
+
 def split_riot_id(riot_id: str) -> Tuple[str, str]:
     riot_id = str(riot_id).strip()
     if "#" not in riot_id:
@@ -892,6 +954,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-timeline", action="store_true", help="Não baixa timeline.")
     parser.add_argument("--max-matches-per-queue", type=int, help="Limite por queue para teste. O padrão é sem limite.")
     parser.add_argument("--force", action="store_true", help="Rebaixa arquivos de partida já existentes e invalida o cache de jogadores.")
+    parser.add_argument("--manual-exclusions-json", default=os.getenv("ARENA_MANUAL_EXCLUSIONS_JSON"), help="JSON com exclusões manuais persistentes por duo_id + match_id. Default: <output>/manual_match_exclusions.json")
     parser.add_argument("--verbose", action="store_true", help="Ativa logs detalhados.")
     return parser.parse_args()
 
@@ -912,6 +975,11 @@ def main() -> int:
 
     output_dir = Path(args.output)
     ensure_dir(output_dir)
+
+    manual_exclusions_path = Path(args.manual_exclusions_json) if args.manual_exclusions_json else (output_dir / "manual_match_exclusions.json")
+    manual_exclusions = load_manual_match_exclusions(manual_exclusions_path)
+    if manual_exclusions:
+        logging.info("Exclusões manuais carregadas: %d entradas de %s", len(manual_exclusions), manual_exclusions_path)
 
     window = TournamentWindow(
         start_local_iso=datetime.fromtimestamp(args.start_time, tz=TOURNAMENT_TZ).isoformat(),
@@ -1086,6 +1154,7 @@ def main() -> int:
     invalid_rows: List[Dict[str, Any]] = []
     download_errors: List[Dict[str, Any]] = []
     downloaded_match_ids: Set[str] = set()
+    manual_excluded_matches_count = 0
 
     for duo in duos:
         p1_ids = set(player_match_ids.get(duo.player1_riot_id, {}).get("match_ids", []))
@@ -1104,6 +1173,21 @@ def main() -> int:
             if match_id in p2_ids:
                 source_parts.append("player2")
             source_label = "+".join(source_parts) if source_parts else "unknown"
+
+            exclusion = manual_exclusions.get((duo.duo_id, match_id))
+            if exclusion is not None:
+                manual_excluded_matches_count += 1
+                logging.info(
+                    "[%s/%s] Dupla %s | excluída manualmente %s (%s)",
+                    idx, len(candidate_ids), duo.duo_id, match_id, exclusion.get("reason") or "manual_exclusion"
+                )
+                invalid_rows.append(build_manual_exclusion_row(
+                    duo=duo,
+                    match_id=match_id,
+                    source_label=source_label,
+                    exclusion=exclusion,
+                ))
+                continue
 
             try:
                 logging.info(
@@ -1197,6 +1281,7 @@ def main() -> int:
             "valid_matches_count": len(valid_rows),
             "invalid_matches_count": len(invalid_rows),
             "download_errors_count": len(download_errors),
+            "manual_excluded_matches_count": manual_excluded_matches_count,
         },
     }
     save_json(output_dir / "public_snapshot.json", public_snapshot)
@@ -1218,6 +1303,7 @@ def main() -> int:
         "duo_resolution_errors_count": len(duo_resolution_errors),
         "player_match_id_errors_count": len(player_match_id_errors),
         "download_errors_count": len(download_errors),
+        "manual_excluded_matches_count": manual_excluded_matches_count,
         "include_timeline": not args.no_timeline,
         "output_dir": str(output_dir.resolve()),
         "paths": {
@@ -1229,6 +1315,7 @@ def main() -> int:
             "duo_matches_csv": str((output_dir / "duo_matches.csv").resolve()),
             "scoreboard_csv": str((output_dir / "scoreboard.csv").resolve()),
             "public_snapshot_json": str((output_dir / "public_snapshot.json").resolve()),
+            "manual_match_exclusions_json": str(manual_exclusions_path.resolve()),
             "raw_matches_dir": str(raw_matches_dir.resolve()),
             "raw_timelines_dir": str(raw_timelines_dir.resolve()) if not args.no_timeline else None,
         },
